@@ -1,4 +1,5 @@
 import torch, warnings, glob, os, types
+from torch.profiler import profiler, ProfilerActivity
 import numpy as np
 from PIL import Image
 from einops import repeat, reduce
@@ -76,7 +77,7 @@ class WanVideoPipeline(BasePipeline):
             WanVideoPostUnit_S2V(),
         ]
         self.model_fn = model_fn_wan_video
-    
+
     def load_lora(
         self,
         module: torch.nn.Module,
@@ -104,18 +105,18 @@ class WanVideoPipeline(BasePipeline):
         else:
             loader = GeneralLoRALoader(torch_dtype=self.torch_dtype, device=self.device)
             loader.load(module, lora, alpha=alpha)
-        
+
     def training_loss(self, **inputs):
         max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * self.scheduler.num_train_timesteps)
         min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * self.scheduler.num_train_timesteps)
         timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
         timestep = self.scheduler.timesteps[timestep_id].to(dtype=self.torch_dtype, device=self.device)
-        
+
         inputs["latents"] = self.scheduler.add_noise(inputs["input_latents"], inputs["noise"], timestep)
         training_target = self.scheduler.training_target(inputs["input_latents"], inputs["noise"], timestep)
-        
+
         noise_pred = self.model_fn(**inputs, timestep=timestep)
-        
+
         loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
         loss = loss * self.scheduler.training_weight(timestep)
         return loss
@@ -308,8 +309,8 @@ class WanVideoPipeline(BasePipeline):
                     computation_device=self.device,
                 ),
             )
-            
-            
+
+
     def initialize_usp(self):
         import torch.distributed as dist
         from xfuser.core.distributed import initialize_model_parallel, init_distributed_environment
@@ -321,8 +322,8 @@ class WanVideoPipeline(BasePipeline):
             ulysses_degree=dist.get_world_size(),
         )
         torch.cuda.set_device(dist.get_rank())
-            
-            
+
+
     def enable_usp(self):
         from xfuser.core.distributed import get_sequence_parallel_world_size
         from ..distributed.xdit_context_parallel import usp_attn_forward, usp_dit_forward
@@ -361,11 +362,11 @@ class WanVideoPipeline(BasePipeline):
                 if model_config.origin_file_pattern in redirect_dict and model_config.model_id != redirect_dict[model_config.origin_file_pattern]:
                     print(f"To avoid repeatedly downloading model files, ({model_config.model_id}, {model_config.origin_file_pattern}) is redirected to ({redirect_dict[model_config.origin_file_pattern]}, {model_config.origin_file_pattern}). You can use `redirect_common_files=False` to disable file redirection.")
                     model_config.model_id = redirect_dict[model_config.origin_file_pattern]
-        
+
         # Initialize pipeline
         pipe = WanVideoPipeline(device=device, torch_dtype=torch_dtype)
         if use_usp: pipe.initialize_usp()
-        
+
         # Download and load models
         model_manager = ModelManager()
         for model_config in model_configs:
@@ -375,7 +376,7 @@ class WanVideoPipeline(BasePipeline):
                 device=model_config.offload_device or device,
                 torch_dtype=model_config.offload_dtype or torch_dtype
             )
-        
+
         # Load models
         pipe.text_encoder = model_manager.fetch_model("wan_video_text_encoder")
         dit = model_manager.fetch_model("wan_video_dit", index=2)
@@ -482,7 +483,7 @@ class WanVideoPipeline(BasePipeline):
     ):
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
-        
+
         # Inputs
         inputs_posi = {
             "prompt": prompt,
@@ -515,32 +516,64 @@ class WanVideoPipeline(BasePipeline):
         # Denoise
         self.load_models_to_device(self.in_iteration_models)
         models = {name: getattr(self, name) for name in self.in_iteration_models}
-        for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
-            # Switch DiT if necessary
-            if timestep.item() < switch_DiT_boundary * self.scheduler.num_train_timesteps and self.dit2 is not None and not models["dit"] is self.dit2:
-                self.load_models_to_device(self.in_iteration_models_2)
-                models["dit"] = self.dit2
-                models["vace"] = self.vace2
-                
-            # Timestep
-            timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
-            
-            # Inference
-            noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
-            if cfg_scale != 1.0:
-                if cfg_merge:
-                    noise_pred_posi, noise_pred_nega = noise_pred_posi.chunk(2, dim=0)
-                else:
-                    noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep)
-                noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
-            else:
-                noise_pred = noise_pred_posi
 
-            # Scheduler
-            inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
-            if "first_frame_latents" in inputs_shared:
-                inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
-        
+        with torch.profiler.profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=True,
+        ) as prof:
+            for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
+                # Switch DiT if necessary
+                if timestep.item() < switch_DiT_boundary * self.scheduler.num_train_timesteps and self.dit2 is not None and not models["dit"] is self.dit2:
+                    self.load_models_to_device(self.in_iteration_models_2)
+                    models["dit"] = self.dit2
+                    models["vace"] = self.vace2
+
+                # Timestep
+                timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
+
+                # Inference
+                noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
+                if cfg_scale != 1.0:
+                    if cfg_merge:
+                        noise_pred_posi, noise_pred_nega = noise_pred_posi.chunk(2, dim=0)
+                    else:
+                        noise_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, timestep=timestep)
+                    noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+                else:
+                    noise_pred = noise_pred_posi
+
+                # Scheduler
+                inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
+                if "first_frame_latents" in inputs_shared:
+                    inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
+
+        # Create directory for traces and save with unique filename per process
+        trace_dir = "trace_new"
+        os.makedirs(trace_dir, exist_ok=True)
+
+        # Get process rank - check environment variables first (most common in distributed training)
+        rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', -1)))
+
+        # Fallback to torch.distributed if env vars not set
+        if rank == -1:
+            try:
+                import torch.distributed as dist
+                if dist.is_initialized():
+                    rank = dist.get_rank()
+                else:
+                    rank = torch.cuda.current_device() if torch.cuda.is_available() else 0
+            except:
+                rank = torch.cuda.current_device() if torch.cuda.is_available() else 0
+
+        trace_path = os.path.join(trace_dir, f"trace_rank_{rank}.json")
+        try:
+            prof.export_chrome_trace(trace_path)
+            print(f"Trace saved to {trace_path}")
+        except Exception as e:
+            print(f"Warning: Failed to save trace to {trace_path}: {e}")
+
         # VACE (TODO: remove it)
         if vace_reference_image is not None or (animate_pose_video is not None and animate_face_video is not None):
             if vace_reference_image is not None and isinstance(vace_reference_image, list):
@@ -585,7 +618,7 @@ class WanVideoUnit_NoiseInitializer(PipelineUnit):
         if vace_reference_image is not None:
             noise = torch.concat((noise[:, :, -f:], noise[:, :, :-f]), dim=2)
         return {"noise": noise}
-    
+
 
 
 class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
@@ -661,7 +694,7 @@ class WanVideoUnit_ImageEmbedder(PipelineUnit):
         msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
         msk = msk.view(1, msk.shape[1] // 4, 4, height//8, width//8)
         msk = msk.transpose(1, 2)[0]
-        
+
         y = pipe.vae.encode([vae_input.to(dtype=pipe.torch_dtype, device=pipe.device)], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0]
         y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
         y = torch.concat([msk, y])
@@ -691,7 +724,7 @@ class WanVideoUnit_ImageEmbedderCLIP(PipelineUnit):
                 clip_context = torch.concat([clip_context, pipe.image_encoder.encode_image([end_image])], dim=1)
         clip_context = clip_context.to(dtype=pipe.torch_dtype, device=pipe.device)
         return {"clip_feature": clip_context}
-    
+
 
 
 class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
@@ -718,7 +751,7 @@ class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
         msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
         msk = msk.view(1, msk.shape[1] // 4, 4, height//8, width//8)
         msk = msk.transpose(1, 2)[0]
-        
+
         y = pipe.vae.encode([vae_input.to(dtype=pipe.torch_dtype, device=pipe.device)], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0]
         y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
         y = torch.concat([msk, y])
@@ -771,7 +804,7 @@ class WanVideoUnit_FunControl(PipelineUnit):
             y = y[:, -y_dim:]
         y = torch.concat([control_latents, y], dim=1)
         return {"clip_feature": clip_feature, "y": y}
-    
+
 
 
 class WanVideoUnit_FunReference(PipelineUnit):
@@ -809,7 +842,7 @@ class WanVideoUnit_FunCameraControl(PipelineUnit):
         pipe.load_models_to_device(self.onload_model_names)
         camera_control_plucker_embedding = pipe.dit.control_adapter.process_camera_coordinates(
             camera_control_direction, num_frames, height, width, camera_control_speed, camera_control_origin)
-        
+
         control_camera_video = camera_control_plucker_embedding[:num_frames].permute([3, 0, 1, 2]).unsqueeze(0)
         control_camera_latents = torch.concat(
             [
@@ -821,7 +854,7 @@ class WanVideoUnit_FunCameraControl(PipelineUnit):
         control_camera_latents = control_camera_latents.contiguous().view(b, f // 4, 4, c, h, w).transpose(2, 3)
         control_camera_latents = control_camera_latents.contiguous().view(b, f // 4, c * 4, h, w).transpose(1, 2)
         control_camera_latents_input = control_camera_latents.to(device=pipe.device, dtype=pipe.torch_dtype)
-        
+
         input_image = input_image.resize((width, height))
         input_latents = pipe.preprocess_video([input_image])
         input_latents = pipe.vae.encode(input_latents, device=pipe.device)
@@ -878,21 +911,21 @@ class WanVideoUnit_VACE(PipelineUnit):
                 vace_video = torch.zeros((1, 3, num_frames, height, width), dtype=pipe.torch_dtype, device=pipe.device)
             else:
                 vace_video = pipe.preprocess_video(vace_video)
-            
+
             if vace_video_mask is None:
                 vace_video_mask = torch.ones_like(vace_video)
             else:
                 vace_video_mask = pipe.preprocess_video(vace_video_mask, min_value=0, max_value=1)
-            
+
             inactive = vace_video * (1 - vace_video_mask) + 0 * vace_video_mask
             reactive = vace_video * vace_video_mask + 0 * (1 - vace_video_mask)
             inactive = pipe.vae.encode(inactive, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
             reactive = pipe.vae.encode(reactive, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
             vace_video_latents = torch.concat((inactive, reactive), dim=1)
-            
+
             vace_mask_latents = rearrange(vace_video_mask[0,0], "T (H P) (W Q) -> 1 (P Q) T H W", P=8, Q=8)
             vace_mask_latents = torch.nn.functional.interpolate(vace_mask_latents, size=((vace_mask_latents.shape[2] + 3) // 4, vace_mask_latents.shape[3], vace_mask_latents.shape[4]), mode='nearest-exact')
-            
+
             if vace_reference_image is None:
                 pass
             else:
@@ -906,14 +939,14 @@ class WanVideoUnit_VACE(PipelineUnit):
                 for j in range(f):
                     new_vace_ref_images.append(vace_reference_image[0, :, j:j+1])
                 vace_reference_image = new_vace_ref_images
-                
+
                 vace_reference_latents = pipe.vae.encode(vace_reference_image, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
                 vace_reference_latents = torch.concat((vace_reference_latents, torch.zeros_like(vace_reference_latents)), dim=1)
                 vace_reference_latents = [u.unsqueeze(0) for u in vace_reference_latents]
 
                 vace_video_latents = torch.concat((*vace_reference_latents, vace_video_latents), dim=2)
                 vace_mask_latents = torch.concat((torch.zeros_like(vace_mask_latents[:, :, :f]), vace_mask_latents), dim=2)
-            
+
             vace_context = torch.concat((vace_video_latents, vace_mask_latents), dim=1)
             return {"vace_context": vace_context, "vace_scale": vace_scale}
         else:
@@ -1114,7 +1147,7 @@ class WanVideoPostUnit_AnimateInpaint(PipelineUnit):
             input_params=("animate_inpaint_video", "animate_mask_video", "input_image", "tiled", "tile_size", "tile_stride"),
             onload_model_names=("vae",)
         )
-        
+
     def get_i2v_mask(self, lat_t, lat_h, lat_w, mask_len=1, mask_pixel_values=None, device="cuda"):
         if mask_pixel_values is None:
             msk = torch.zeros(1, (lat_t-1) * 4 + 1, lat_h, lat_w, device=device)
@@ -1134,18 +1167,18 @@ class WanVideoPostUnit_AnimateInpaint(PipelineUnit):
         bg_pixel_values = pipe.preprocess_video(animate_inpaint_video)
         y_reft = pipe.vae.encode(bg_pixel_values, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0].to(dtype=pipe.torch_dtype, device=pipe.device)
         _, lat_t, lat_h, lat_w = y_reft.shape
-        
+
         ref_pixel_values = pipe.preprocess_video([input_image])
         ref_latents = pipe.vae.encode(ref_pixel_values, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
         mask_ref = self.get_i2v_mask(1, lat_h, lat_w, 1, device=pipe.device)
         y_ref = torch.concat([mask_ref, ref_latents[0]]).to(dtype=torch.bfloat16, device=pipe.device)
-        
+
         mask_pixel_values = 1 - pipe.preprocess_video(animate_mask_video, max_value=1, min_value=0)
         mask_pixel_values = rearrange(mask_pixel_values, "b c t h w -> (b t) c h w")
         mask_pixel_values = torch.nn.functional.interpolate(mask_pixel_values, size=(lat_h, lat_w), mode='nearest')
         mask_pixel_values = rearrange(mask_pixel_values, "(b t) c h w -> b t c h w", b=1)[:,:,0]
         msk_reft = self.get_i2v_mask(lat_t, lat_h, lat_w, 0, mask_pixel_values=mask_pixel_values, device=pipe.device)
-        
+
         y_reft = torch.concat([msk_reft, y_reft]).to(dtype=torch.bfloat16, device=pipe.device)
         y = torch.concat([y_ref, y_reft], dim=1).unsqueeze(0)
         return {"y": y}
@@ -1160,7 +1193,7 @@ class TeaCache:
         self.rel_l1_thresh = rel_l1_thresh
         self.previous_residual = None
         self.previous_hidden_states = None
-        
+
         self.coefficients_dict = {
             "Wan2.1-T2V-1.3B": [-5.21862437e+04, 9.23041404e+03, -5.28275948e+02, 1.36987616e+01, -4.99875664e-02],
             "Wan2.1-T2V-14B": [-3.03318725e+05, 4.90537029e+04, -2.65530556e+03, 5.87365115e+01, -3.15583525e-01],
@@ -1212,7 +1245,7 @@ class TemporalTiler_BCTHW:
         x = torch.ones((length,))
         if border_width == 0:
             return x
-        
+
         shift = 0.5
         if not left_bound:
             x[:border_width] = (torch.arange(border_width) + shift) / border_width
@@ -1225,7 +1258,7 @@ class TemporalTiler_BCTHW:
         t = self.build_1d_mask(T, is_bound[0], is_bound[1], border_width[0])
         mask = repeat(t, "T -> 1 1 T 1 1")
         return mask
-    
+
     def run(self, model_fn, sliding_window_size, sliding_window_stride, computation_device, computation_dtype, model_kwargs, tensor_names, batch_size=None):
         tensor_names = [tensor_name for tensor_name in tensor_names if model_kwargs.get(tensor_name) is not None]
         tensor_dict = {tensor_name: model_kwargs[tensor_name] for tensor_name in tensor_names}
@@ -1350,7 +1383,7 @@ def model_fn_wan_video(
     else:
         t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
         t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
-    
+
     # Motion Controller
     if motion_bucket_id is not None and motion_controller is not None:
         t_mod = t_mod + motion_controller(motion_bucket_id).unflatten(1, (6, dit.dim))
@@ -1369,18 +1402,18 @@ def model_fn_wan_video(
     if clip_feature is not None and dit.require_clip_embedding:
         clip_embdding = dit.img_emb(clip_feature)
         context = torch.cat([clip_embdding, context], dim=1)
-    
+
     # Camera control
     x = dit.patchify(x, control_camera_latents_input)
-    
+
     # Animate
     if pose_latents is not None and face_pixel_values is not None:
         x, motion_vec = animate_adapter.after_patch_embedding(x, pose_latents, face_pixel_values)
-    
+
     # Patchify
     f, h, w = x.shape[2:]
     x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
-    
+
     # Reference image
     if reference_latents is not None:
         if len(reference_latents.shape) == 5:
@@ -1388,26 +1421,26 @@ def model_fn_wan_video(
         reference_latents = dit.ref_conv(reference_latents).flatten(2).transpose(1, 2)
         x = torch.concat([reference_latents, x], dim=1)
         f += 1
-    
+
     freqs = torch.cat([
         dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
         dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-    
+
     # TeaCache
     if tea_cache is not None:
         tea_cache_update = tea_cache.check(dit, x, t_mod)
     else:
         tea_cache_update = False
-        
+
     if vace_context is not None:
         vace_hints = vace(
             x, vace_context, context, t_mod, freqs,
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload
         )
-    
+
     # blocks
     if use_unified_sequence_parallel:
         if dist.is_initialized() and dist.get_world_size() > 1:
@@ -1422,7 +1455,7 @@ def model_fn_wan_video(
             def custom_forward(*inputs):
                 return module(*inputs)
             return custom_forward
-        
+
         for block_id, block in enumerate(dit.blocks):
             # Block
             if use_gradient_checkpointing_offload:
@@ -1440,7 +1473,7 @@ def model_fn_wan_video(
                 )
             else:
                 x = block(x, context, t_mod, freqs)
-            
+
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:
                 current_vace_hint = vace_hints[vace.vace_layers_mapping[block_id]]
@@ -1448,13 +1481,13 @@ def model_fn_wan_video(
                     current_vace_hint = torch.chunk(current_vace_hint, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
                     current_vace_hint = torch.nn.functional.pad(current_vace_hint, (0, 0, 0, chunks[0].shape[1] - current_vace_hint.shape[1]), value=0)
                 x = x + current_vace_hint * vace_scale
-            
+
             # Animate
             if pose_latents is not None and face_pixel_values is not None:
                 x = animate_adapter.after_transformer_block(block_id, x, motion_vec)
         if tea_cache is not None:
             tea_cache.store(x)
-            
+
     x = dit.head(x, t)
     if use_unified_sequence_parallel:
         if dist.is_initialized() and dist.get_world_size() > 1:
