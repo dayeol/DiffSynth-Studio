@@ -7,9 +7,17 @@ from einops import rearrange
 from .utils import hash_state_dict_keys
 from .wan_video_camera_controller import SimpleAdapter
 try:
-    import flash_attn_interface
+    from flash_attn.cute import interface as flash_cute
+    FLASH_CUTE_AVAILABLE = True
+    FLASH_CUTE_CUSTOM_OP_AVAILABLE = False  # CuTe DSL not compatible with torch.compile + CUDA graphs
+except (ModuleNotFoundError, ImportError, AttributeError):
+    FLASH_CUTE_AVAILABLE = False
+    FLASH_CUTE_CUSTOM_OP_AVAILABLE = False
+
+try:
+    from flash_attn import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     FLASH_ATTN_3_AVAILABLE = False
 
 try:
@@ -19,19 +27,84 @@ except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
 try:
+    import torch
+    import fbgemm_gpu.experimental.gen_ai  # noqa: F401
+    # Test if FBGEMM FMHA operators are available
+    FBGEMM_FMHA_AVAILABLE = hasattr(torch.ops.fbgemm, 'fmha_fwd')
+except (ModuleNotFoundError, ImportError):
+    FBGEMM_FMHA_AVAILABLE = False
+
+try:
     from sageattention import sageattn
     SAGE_ATTN_AVAILABLE = True
 except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
-    
-    
-def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
+
+# Log which attention kernel is available (only once)
+_ATTENTION_KERNEL_LOGGED = False
+
+def _log_attention_kernel():
+    global _ATTENTION_KERNEL_LOGGED
+    if not _ATTENTION_KERNEL_LOGGED:
+        import os
+        if os.environ.get('USE_FBGEMM_FMHA', '0') == '1' and FBGEMM_FMHA_AVAILABLE:
+            print("Attention kernel: FBGEMM Blackwell FMHA (CUTLASS SM100, torch.compile compatible)")
+        elif os.environ.get('USE_CUTE_DSL', '0') == '1' and FLASH_CUTE_AVAILABLE:
+            print("Attention kernel: FlashAttention CuTe DSL (Blackwell SM100 optimized)")
+        elif FLASH_ATTN_3_AVAILABLE:
+            print("Attention kernel: FlashAttention-3 (fav3)")
+        elif FLASH_ATTN_2_AVAILABLE:
+            print("Attention kernel: FlashAttention-2 (fav2)")
+        elif SAGE_ATTN_AVAILABLE:
+            print("Attention kernel: SageAttention")
+        else:
+            print("Attention kernel: PyTorch scaled_dot_product_attention (no flash attention)")
+        _ATTENTION_KERNEL_LOGGED = True
+
+
+# Helper function for CuTe DSL that bypasses torch.compile
+@torch.compiler.disable
+def _flash_cute_dsl_call(q, k, v, num_heads):
+    """CuTe DSL call - excluded from torch.compile to avoid CUDA graph issues"""
+    q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
+    k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
+    v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
+    out = flash_cute._flash_attn_fwd(q, k, v)
+    if isinstance(out, tuple):
+        x = out[0]
+    else:
+        x = out
+    x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+    return x
+
+
+def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False, _use_cute_dsl=None, _use_fbgemm_fmha=None):
+    _log_attention_kernel()
+
+    # Enable by default, can override with environment variable
+    import os
+    if _use_cute_dsl is None:
+        _use_cute_dsl = os.environ.get('USE_CUTE_DSL', '0') == '1'
+    if _use_fbgemm_fmha is None:
+        _use_fbgemm_fmha = os.environ.get('USE_FBGEMM_FMHA', '0') == '1'
+
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
         x = F.scaled_dot_product_attention(q, k, v)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+    elif FBGEMM_FMHA_AVAILABLE and _use_fbgemm_fmha:
+        # Use FBGEMM Blackwell FMHA (works with torch.compile!)
+        q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
+        k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
+        v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
+        x, _ = torch.ops.fbgemm.fmha_fwd(q, k, v)
+        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+    elif FLASH_CUTE_AVAILABLE and _use_cute_dsl:
+        # Use CuTe DSL - wrapped in @torch.compiler.disable to skip compilation
+        # This allows torch.compile to work on the rest of the model
+        x = _flash_cute_dsl_call(q, k, v, num_heads)
     elif FLASH_ATTN_3_AVAILABLE:
         q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
@@ -115,8 +188,10 @@ class AttentionModule(nn.Module):
     def __init__(self, num_heads):
         super().__init__()
         self.num_heads = num_heads
-        
+
     def forward(self, q, k, v):
+        # Note: torch.compiler.disable() context manager doesn't work inside compiled code
+        # CuTe DSL should work fine with torch.compile, so we removed the disable wrapper
         x = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads)
         return x
 
@@ -134,7 +209,7 @@ class SelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
-        
+
         self.attn = AttentionModule(self.num_heads)
 
     def forward(self, x, freqs):
@@ -165,7 +240,7 @@ class CrossAttention(nn.Module):
             self.k_img = nn.Linear(dim, dim)
             self.v_img = nn.Linear(dim, dim)
             self.norm_k_img = RMSNorm(dim, eps=eps)
-            
+
         self.attn = AttentionModule(self.num_heads)
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):
@@ -347,7 +422,7 @@ class WanModel(torch.nn.Module):
     def unpatchify(self, x: torch.Tensor, grid_size: torch.Tensor):
         return rearrange(
             x, 'b (f h w) (x y z c) -> b c (f x) (h y) (w z)',
-            f=grid_size[0], h=grid_size[1], w=grid_size[2], 
+            f=grid_size[0], h=grid_size[1], w=grid_size[2],
             x=self.patch_size[0], y=self.patch_size[1], z=self.patch_size[2]
         )
 
@@ -365,20 +440,20 @@ class WanModel(torch.nn.Module):
             sinusoidal_embedding_1d(self.freq_dim, timestep))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
-        
+
         if self.has_image_input:
             x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
             clip_embdding = self.img_emb(clip_feature)
             context = torch.cat([clip_embdding, context], dim=1)
-        
+
         x, (f, h, w) = self.patchify(x)
-        
+
         freqs = torch.cat([
             self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
             self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-        
+
         def create_custom_forward(module):
             def custom_forward(*inputs):
                 return module(*inputs)
@@ -409,8 +484,8 @@ class WanModel(torch.nn.Module):
     @staticmethod
     def state_dict_converter():
         return WanModelStateDictConverter()
-    
-    
+
+
 class WanModelStateDictConverter:
     def __init__(self):
         pass
@@ -491,7 +566,7 @@ class WanModelStateDictConverter:
         else:
             config = {}
         return state_dict_, config
-    
+
     def from_civitai(self, state_dict):
         state_dict = {name: param for name, param in state_dict.items() if not name.startswith("vace")}
         state_dict = {name: param for name, param in state_dict.items() if name.split(".")[0] not in ["pose_patch_embedding", "face_adapter", "face_encoder", "motion_encoder"]}
