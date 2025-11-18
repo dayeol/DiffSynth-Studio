@@ -6,6 +6,21 @@ from xfuser.core.distributed import (get_sequence_parallel_rank,
                                      get_sp_group)
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
 
+# Import AttnType and detect AITER availability
+try:
+    from yunchang.kernels import AttnType
+    from yunchang.globals import HAS_AITER
+    if HAS_AITER:
+        DEFAULT_ATTN_TYPE = AttnType.AITER
+    else:
+        try:
+            import flash_attn
+            DEFAULT_ATTN_TYPE = AttnType.FA
+        except ImportError:
+            DEFAULT_ATTN_TYPE = AttnType.TORCH
+except ImportError:
+    DEFAULT_ATTN_TYPE = None
+
 def sinusoidal_embedding_1d(dim, position):
     sinusoid = torch.outer(position.type(torch.float64), torch.pow(
         10000, -torch.arange(dim//2, dtype=torch.float64, device=position.device).div(dim//2)))
@@ -118,12 +133,21 @@ def usp_attn_forward(self, x, freqs):
     k = rearrange(k, "b s (n d) -> b s n d", n=self.num_heads)
     v = rearrange(v, "b s (n d) -> b s n d", n=self.num_heads)
 
-    x = xFuserLongContextAttention()(
-        None,
-        query=q,
-        key=k,
-        value=v,
-    )
+    # Use AITER attention if available, otherwise fall back to FA or TORCH
+    if DEFAULT_ATTN_TYPE is not None:
+        x = xFuserLongContextAttention(attn_type=DEFAULT_ATTN_TYPE)(
+            None,
+            query=q,
+            key=k,
+            value=v,
+        )
+    else:
+        x = xFuserLongContextAttention()(
+            None,
+            query=q,
+            key=k,
+            value=v,
+        )
     x = x.flatten(2)
 
     del q, k, v
